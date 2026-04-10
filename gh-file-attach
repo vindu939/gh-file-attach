@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 RELEASE_TAG="_attachments"
 RELEASE_TITLE="Attachments"
 RELEASE_BODY="Auto-managed release for file attachments. Do not delete."
@@ -102,6 +102,9 @@ Replicates GitHub's "Attach files" feature from the CLI.
 
 USAGE
   gh file-attach [flags] <file> [<file>...]
+  gh file-attach --list [--repo OWNER/REPO]
+  gh file-attach --stats [--repo OWNER/REPO]
+  gh file-attach --cleanup <Nd|N> [--repo OWNER/REPO]
 
 FLAGS
   -r, --repo OWNER/REPO   Target repository (default: current repo)
@@ -111,6 +114,12 @@ FLAGS
       --public             Make the release non-draft (required for browser access)
   -v, --version            Print version
   -h, --help               Show this help
+
+MANAGEMENT
+      --list               List all uploaded attachments with size and date
+      --stats              Show storage usage breakdown by file type
+      --cleanup <Nd>       Delete assets older than N days (e.g. 30d)
+      --cleanup <N>        Keep only the latest N assets, delete the rest (e.g. 100)
 
 ARGUMENTS
   Arguments can be plain file paths or "label:path" pairs.
@@ -145,12 +154,26 @@ SIZE LIMITS
   Code:       10 MB       Archives:  50 MB
   Text/Other: 25 MB
 
+STORAGE
+  Files are uploaded as GitHub Release assets in the target repository.
+  They are stored under a release tagged '_attachments' (configurable with --tag).
+  View uploads in browser: https://github.com/OWNER/REPO/releases/tag/_attachments
+
+  GitHub repo storage limits:
+    Free/Pro/Team: 5 GB total (warning at 1 GB)
+    Enterprise:    100 GB total (warning at 5 GB)
+  Release assets count toward total repo size.
+
 EXAMPLES
   gh file-attach screenshot.png
   gh file-attach -m "Before fix:before.png" "After fix:after.png"
   gh file-attach -m "Demo:recording.mp4" "Logs:debug.log"
   gh file-attach -m -c "Report:quarterly.pdf" data.csv
   gh file-attach --public --repo myorg/myrepo *.png
+  gh file-attach --list
+  gh file-attach --stats
+  gh file-attach --cleanup 30d
+  gh file-attach --cleanup 100
 EOF
   exit 0
 }
@@ -295,6 +318,235 @@ copy_to_clipboard() {
   echo "Copied to clipboard!" >&2
 }
 
+# --- Asset Management Commands -----------------------------------------------
+
+# List all assets in the release
+cmd_list() {
+  local repo="$1"
+
+  if ! gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1; then
+    echo "No attachments found (release '$RELEASE_TAG' does not exist in $repo)" >&2
+    exit 0
+  fi
+
+  local assets
+  assets=$(gh release view "$RELEASE_TAG" --repo "$repo" --json assets \
+    --jq '.assets[] | "\(.name)\t\(.size)\t\(.createdAt)"' 2>/dev/null)
+
+  if [[ -z "$assets" ]]; then
+    echo "No attachments found" >&2
+    exit 0
+  fi
+
+  local count=0
+  local total_size=0
+
+  printf "%-50s %10s  %s\n" "NAME" "SIZE" "UPLOADED"
+  printf "%-50s %10s  %s\n" "----" "----" "--------"
+
+  while IFS=$'\t' read -r name size created; do
+    local human_size
+    if [[ "$size" -ge $((1024 * 1024)) ]]; then
+      human_size="$(( size / 1024 / 1024 )) MB"
+    elif [[ "$size" -ge 1024 ]]; then
+      human_size="$(( size / 1024 )) KB"
+    else
+      human_size="${size} B"
+    fi
+
+    local date_part="${created%%T*}"
+    printf "%-50s %10s  %s\n" "$name" "$human_size" "$date_part"
+    (( count++ )) || true
+    (( total_size += size )) || true
+  done <<< "$assets"
+
+  echo "" >&2
+  local total_human
+  if [[ "$total_size" -ge $((1024 * 1024)) ]]; then
+    total_human="$(( total_size / 1024 / 1024 )) MB"
+  elif [[ "$total_size" -ge 1024 ]]; then
+    total_human="$(( total_size / 1024 )) KB"
+  else
+    total_human="${total_size} B"
+  fi
+  echo "${count} file(s), ${total_human} total" >&2
+}
+
+# Show storage stats
+cmd_stats() {
+  local repo="$1"
+
+  if ! gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1; then
+    echo "No attachments found (release '$RELEASE_TAG' does not exist in $repo)" >&2
+    exit 0
+  fi
+
+  local assets
+  assets=$(gh release view "$RELEASE_TAG" --repo "$repo" --json assets \
+    --jq '.assets[] | "\(.name)\t\(.size)"' 2>/dev/null)
+
+  if [[ -z "$assets" ]]; then
+    echo "No attachments found" >&2
+    exit 0
+  fi
+
+  local count=0 total_size=0
+  local img_count=0 img_size=0
+  local vid_count=0 vid_size=0
+  local aud_count=0 aud_size=0
+  local doc_count=0 doc_size=0
+  local code_count=0 code_size=0
+  local arc_count=0 arc_size=0
+  local other_count=0 other_size=0
+
+  while IFS=$'\t' read -r name size; do
+    local ext="${name##*.}"
+    ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+    local cat
+    cat=$(classify_file "$ext")
+
+    (( count++ )) || true
+    (( total_size += size )) || true
+
+    case "$cat" in
+      image)    (( img_count++ )); (( img_size += size )) ;;
+      video)    (( vid_count++ )); (( vid_size += size )) ;;
+      audio)    (( aud_count++ )); (( aud_size += size )) ;;
+      document) (( doc_count++ )); (( doc_size += size )) ;;
+      code)     (( code_count++ )); (( code_size += size )) ;;
+      archive)  (( arc_count++ )); (( arc_size += size )) ;;
+      *)        (( other_count++ )); (( other_size += size )) ;;
+    esac
+  done <<< "$assets"
+
+  local fmt_size
+  fmt_size() {
+    local s=$1
+    if [[ "$s" -ge $((1024 * 1024)) ]]; then
+      echo "$(( s / 1024 / 1024 )) MB"
+    elif [[ "$s" -ge 1024 ]]; then
+      echo "$(( s / 1024 )) KB"
+    else
+      echo "${s} B"
+    fi
+  }
+
+  echo "Storage stats for '$RELEASE_TAG' in $repo"
+  echo ""
+  printf "  %-12s %5s files  %10s\n" "Images" "$img_count" "$(fmt_size $img_size)"
+  printf "  %-12s %5s files  %10s\n" "Videos" "$vid_count" "$(fmt_size $vid_size)"
+  printf "  %-12s %5s files  %10s\n" "Audio" "$aud_count" "$(fmt_size $aud_size)"
+  printf "  %-12s %5s files  %10s\n" "Documents" "$doc_count" "$(fmt_size $doc_size)"
+  printf "  %-12s %5s files  %10s\n" "Code" "$code_count" "$(fmt_size $code_size)"
+  printf "  %-12s %5s files  %10s\n" "Archives" "$arc_count" "$(fmt_size $arc_size)"
+  printf "  %-12s %5s files  %10s\n" "Other" "$other_count" "$(fmt_size $other_size)"
+  echo "  ────────────────────────────────"
+  printf "  %-12s %5s files  %10s\n" "Total" "$count" "$(fmt_size $total_size)"
+  echo ""
+  echo "GitHub repo storage limits: 5 GB (warning at 1 GB)"
+  echo "Release assets count toward total repo size."
+  echo "View in browser: https://github.com/${repo}/releases/tag/${RELEASE_TAG}"
+}
+
+# Cleanup old assets
+cmd_cleanup() {
+  local repo="$1"
+  local cleanup_arg="$2"
+
+  if ! gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1; then
+    echo "No attachments found (release '$RELEASE_TAG' does not exist in $repo)" >&2
+    exit 0
+  fi
+
+  local assets
+  assets=$(gh release view "$RELEASE_TAG" --repo "$repo" --json assets \
+    --jq '.assets | sort_by(.createdAt) | .[] | "\(.name)\t\(.size)\t\(.createdAt)"' 2>/dev/null)
+
+  if [[ -z "$assets" ]]; then
+    echo "No attachments to clean up" >&2
+    exit 0
+  fi
+
+  local total_count
+  total_count=$(echo "$assets" | wc -l | tr -d ' ')
+
+  local to_delete=()
+
+  if [[ "$cleanup_arg" =~ ^[0-9]+d$ ]]; then
+    # Delete assets older than N days
+    local days="${cleanup_arg%d}"
+    local cutoff
+    if date -v-1d >/dev/null 2>&1; then
+      # macOS
+      cutoff=$(date -v-"${days}"d +%Y-%m-%dT%H:%M:%S)
+    else
+      # Linux
+      cutoff=$(date -d "${days} days ago" +%Y-%m-%dT%H:%M:%S)
+    fi
+
+    while IFS=$'\t' read -r name size created; do
+      if [[ "$created" < "$cutoff" ]]; then
+        to_delete+=("$name")
+      fi
+    done <<< "$assets"
+
+    if [[ ${#to_delete[@]} -eq 0 ]]; then
+      echo "No assets older than ${days} days" >&2
+      exit 0
+    fi
+
+    echo "Found ${#to_delete[@]} asset(s) older than ${days} days (out of ${total_count} total)" >&2
+
+  elif [[ "$cleanup_arg" =~ ^[0-9]+$ ]]; then
+    # Keep only the latest N assets
+    local keep="$cleanup_arg"
+
+    if [[ "$total_count" -le "$keep" ]]; then
+      echo "Only ${total_count} asset(s) — nothing to clean up (keeping ${keep})" >&2
+      exit 0
+    fi
+
+    local delete_count=$(( total_count - keep ))
+    local i=0
+    while IFS=$'\t' read -r name size created; do
+      if [[ "$i" -lt "$delete_count" ]]; then
+        to_delete+=("$name")
+      fi
+      (( i++ )) || true
+    done <<< "$assets"
+
+    echo "Deleting ${#to_delete[@]} oldest asset(s), keeping latest ${keep} (out of ${total_count} total)" >&2
+
+  else
+    die "Invalid cleanup argument: '$cleanup_arg'. Use '<N>d' for days (e.g. 30d) or '<N>' for count (e.g. 100)"
+  fi
+
+  echo "Proceed? (y/N) " >&2
+  read -r confirm
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+    echo "Cancelled" >&2
+    exit 0
+  fi
+
+  local deleted=0
+  local failed=0
+  for name in "${to_delete[@]}"; do
+    if gh release delete-asset "$RELEASE_TAG" "$name" --repo "$repo" --yes >/dev/null 2>&1; then
+      echo "Deleted: $name" >&2
+      (( deleted++ )) || true
+    else
+      echo "Failed to delete: $name" >&2
+      (( failed++ )) || true
+    fi
+  done
+
+  echo "" >&2
+  echo "${deleted} asset(s) deleted" >&2
+  if [[ "$failed" -gt 0 ]]; then
+    echo "${failed} asset(s) failed to delete" >&2
+  fi
+}
+
 # Format a single result as markdown
 format_markdown() {
   local url="$1"
@@ -317,6 +569,8 @@ main() {
 
   local markdown=false
   local clipboard=false
+  local cmd_mode=""
+  local cleanup_arg=""
   local args=()
   REPO=""
   PUBLIC="false"
@@ -338,10 +592,29 @@ main() {
       -m|--markdown) markdown=true; shift ;;
       -c|--clipboard) clipboard=true; shift ;;
       --public)     PUBLIC="true"; shift ;;
+      --list)       cmd_mode="list"; shift ;;
+      --stats)      cmd_mode="stats"; shift ;;
+      --cleanup)
+        cmd_mode="cleanup"
+        cleanup_arg="${2:?--cleanup requires an argument (e.g. 30d or 100)}"
+        shift 2
+        ;;
       -*)           die "Unknown flag: $1 (use --help for usage)" ;;
       *)            args+=("$1"); shift ;;
     esac
   done
+
+  # Handle management commands
+  if [[ -n "$cmd_mode" ]]; then
+    local repo
+    repo=$(resolve_repo)
+    case "$cmd_mode" in
+      list)    cmd_list "$repo" ;;
+      stats)   cmd_stats "$repo" ;;
+      cleanup) cmd_cleanup "$repo" "$cleanup_arg" ;;
+    esac
+    exit 0
+  fi
 
   [[ ${#args[@]} -gt 0 ]] || die "No files specified. Usage: gh file-attach <file> [<file>...]"
 

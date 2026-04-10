@@ -148,7 +148,7 @@ $ gh file-attach --public -m screenshot.png
 
 ```bash
 $ gh file-attach --version
-gh-file-attach 1.0.0
+gh-file-attach 1.1.0
 
 $ gh file-attach --help
 # prints full usage information
@@ -167,6 +167,68 @@ $ gh file-attach --help
 | **Text/Data** | TXT, MD, CSV, TSV, LOG, JSON, TOML, INI, CFG, CONF | 25 MB |
 | **Other** | DEBUG, MSG, EML, DMP, PDB, CPUPROFILE | 25 MB |
 
+## Managing Attachments
+
+### List all uploads (`--list`)
+
+```bash
+$ gh file-attach --list
+NAME                                                     SIZE  UPLOADED
+----                                                     ----  --------
+screenshot-20260410-091857-8438f428.png                  13 KB  2026-04-10
+recording-20260410-091901-384e83de.mp4                    2 MB  2026-04-10
+report-20260410-091905-973dc268.pdf                     302 B   2026-04-10
+
+3 file(s), 2 MB total
+```
+
+### Storage stats (`--stats`)
+
+See a breakdown of storage usage by file type:
+
+```bash
+$ gh file-attach --stats
+Storage stats for '_attachments' in you/repo
+
+  Images           4 files      120 KB
+  Videos           2 files        8 MB
+  Documents        1 files      302 B
+  Code             3 files      276 B
+  Archives         1 files      478 B
+  ────────────────────────────────
+  Total           11 files        8 MB
+
+GitHub repo storage limits: 5 GB (warning at 1 GB)
+Release assets count toward total repo size.
+View in browser: https://github.com/you/repo/releases/tag/_attachments
+```
+
+### Cleanup old assets (`--cleanup`)
+
+Delete by age — remove assets older than N days:
+
+```bash
+$ gh file-attach --cleanup 30d
+Found 5 asset(s) older than 30 days (out of 18 total)
+Proceed? (y/N) y
+Deleted: old-screenshot-20260301-a1b2c3d4.png
+Deleted: old-recording-20260305-b2c3d4e5.mp4
+...
+5 asset(s) deleted
+```
+
+Delete by count — keep only the latest N assets:
+
+```bash
+$ gh file-attach --cleanup 100
+Deleting 20 oldest asset(s), keeping latest 100 (out of 120 total)
+Proceed? (y/N) y
+...
+20 asset(s) deleted
+```
+
+Both strategies ask for confirmation before deleting.
+
 ## How It Works
 
 1. Uses your `gh` auth token (via `gh release` commands) — no separate API keys or env vars
@@ -174,7 +236,20 @@ $ gh file-attach --help
 3. Uploads files as release assets with unique timestamped names
 4. Returns permanent download URLs
 
+**Where files are stored**: Files are uploaded as [GitHub Release](https://docs.github.com/en/repositories/releasing-projects-on-github/about-releases) assets under a release tagged `_attachments`. You can view, download, and manage them from the Releases page in your repo.
+
 **Visibility**: For private repos, uploaded files are accessible to users with repo access. Use `--public` flag so URLs work in browsers and render in PR descriptions.
+
+## Storage Limits
+
+GitHub Release assets count toward your total repository size:
+
+| Plan | Warning | Hard Limit |
+|---|---|---|
+| Free / Pro / Team | 1 GB | 5 GB |
+| Enterprise | 5 GB | 100 GB |
+
+Use `gh file-attach --stats` to monitor usage and `--cleanup` to remove old assets.
 
 ## Limits
 
