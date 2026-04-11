@@ -10,10 +10,11 @@
 
 set -euo pipefail
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 RELEASE_TAG="_attachments"
 RELEASE_TITLE="Attachments"
 RELEASE_BODY="Auto-managed release for file attachments. Do not delete."
+MAX_FILES_PER_RUN=50
 
 # Size limits per category (bytes)
 MAX_IMAGE_SIZE=$((50 * 1024 * 1024))    # 50 MB
@@ -153,6 +154,7 @@ SIZE LIMITS
   Audio:      50 MB       Documents: 25 MB
   Code:       10 MB       Archives:  50 MB
   Text/Other: 25 MB
+  Max files per run: $MAX_FILES_PER_RUN
 
 STORAGE
   Files are uploaded as GitHub Release assets in the target repository.
@@ -181,6 +183,26 @@ EOF
 check_prereqs() {
   command -v gh >/dev/null 2>&1 || die "gh CLI is required. Install: https://cli.github.com"
   gh auth status >/dev/null 2>&1 || die "Not authenticated. Run: gh auth login"
+  # URL encoding requires jq or python3
+  if ! command -v jq >/dev/null 2>&1 && ! command -v python3 >/dev/null 2>&1; then
+    die "jq or python3 is required for URL encoding. Install one: brew install jq"
+  fi
+}
+
+# Validate repo format: owner/repo with allowed characters
+validate_repo() {
+  local repo="$1"
+  if [[ ! "$repo" =~ ^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$ ]]; then
+    die "Invalid repo format: '$repo' (expected OWNER/REPO, e.g. myorg/myrepo)"
+  fi
+}
+
+# Validate tag format: alphanumeric, dots, hyphens, underscores, slashes
+validate_tag() {
+  local tag="$1"
+  if [[ ! "$tag" =~ ^[a-zA-Z0-9._/-]+$ ]]; then
+    die "Invalid tag format: '$tag' (only alphanumeric, dots, hyphens, underscores, slashes allowed)"
+  fi
 }
 
 resolve_repo() {
@@ -194,21 +216,13 @@ resolve_repo() {
   echo "$repo"
 }
 
+# Percent-encode a string for use in URLs (requires jq or python3)
 urlencode() {
   local string="$1"
   if command -v jq >/dev/null 2>&1; then
     printf '%s' "$string" | jq -rR @uri
-  elif command -v python3 >/dev/null 2>&1; then
-    python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$string"
   else
-    printf '%s' "$string" | sed \
-      -e 's/%/%25/g' \
-      -e 's/ /%20/g' \
-      -e 's/#/%23/g' \
-      -e 's/?/%3F/g' \
-      -e 's/&/%26/g' \
-      -e 's/+/%2B/g' \
-      -e 's/=/%3D/g'
+    python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$string"
   fi
 }
 
@@ -229,11 +243,10 @@ ensure_release() {
       --repo "$repo" \
       --title "$RELEASE_TITLE" \
       --notes "$RELEASE_BODY" \
-      "${draft_args[@]}" >/dev/null 2>&1 \
+      ${draft_args[@]+"${draft_args[@]}"} >/dev/null 2>&1 \
       || die "Failed to create release '$RELEASE_TAG' in $repo"
     echo "Created release '$RELEASE_TAG' in $repo" >&2
   elif [[ "${PUBLIC:-false}" == "true" ]]; then
-    # If release exists but --public was requested, ensure it's not a draft
     local is_draft
     is_draft=$(gh release view "$RELEASE_TAG" --repo "$repo" --json isDraft --jq '.isDraft' 2>/dev/null || echo "false")
     if [[ "$is_draft" == "true" ]]; then
@@ -247,11 +260,29 @@ unique_name() {
   local file="$1"
   local base ext ts rand
   base=$(basename "$file")
-  ext="${base##*.}"
-  base="${base%.*}"
+
+  # Handle files with no extension or dotfiles
+  if [[ "$base" == *.* && "$base" != .* ]]; then
+    ext="${base##*.}"
+    base="${base%.*}"
+  elif [[ "$base" == .* && "$base" == *.*.* ]]; then
+    # Dotfile with extension like .config.yaml
+    ext="${base##*.}"
+    base="${base%.*}"
+  else
+    # No extension (Makefile) or simple dotfile (.gitignore)
+    ext=""
+    base="$base"
+  fi
+
   ts=$(date +%Y%m%d-%H%M%S)
   rand=$(head -c 4 /dev/urandom | od -An -tx4 | tr -d ' ')
-  echo "${base}-${ts}-${rand}.${ext}"
+
+  if [[ -n "$ext" ]]; then
+    echo "${base}-${ts}-${rand}.${ext}"
+  else
+    echo "${base}-${ts}-${rand}"
+  fi
 }
 
 upload_file() {
@@ -280,17 +311,19 @@ upload_file() {
   # Copy to temp file with unique name so asset filename matches URL
   local tmp_dir
   tmp_dir=$(mktemp -d)
+  trap 'rm -rf "$tmp_dir" 2>/dev/null' EXIT INT TERM
   local tmp_file="${tmp_dir}/${asset_name}"
   cp "$file" "$tmp_file"
 
   local upload_ok=true
-  if ! gh release upload "$RELEASE_TAG" "$tmp_file" \
+  if ! gh release upload "$RELEASE_TAG" \
     --repo "$repo" \
-    --clobber >/dev/null 2>&1; then
+    --clobber -- "$tmp_file" >/dev/null 2>&1; then
     upload_ok=false
   fi
 
   rm -rf "$tmp_dir"
+  trap - EXIT INT TERM
   [[ "$upload_ok" == true ]] || die "Upload failed for $file"
 
   local tag_encoded asset_encoded
@@ -340,12 +373,12 @@ cmd_list() {
 
   local count=0
   local total_size=0
+  local human_size date_part
 
   printf "%-50s %10s  %s\n" "NAME" "SIZE" "UPLOADED"
   printf "%-50s %10s  %s\n" "----" "----" "--------"
 
   while IFS=$'\t' read -r name size created; do
-    local human_size
     if [[ "$size" -ge $((1024 * 1024)) ]]; then
       human_size="$(( size / 1024 / 1024 )) MB"
     elif [[ "$size" -ge 1024 ]]; then
@@ -354,7 +387,7 @@ cmd_list() {
       human_size="${size} B"
     fi
 
-    local date_part="${created%%T*}"
+    date_part="${created%%T*}"
     printf "%-50s %10s  %s\n" "$name" "$human_size" "$date_part"
     (( count++ )) || true
     (( total_size += size )) || true
@@ -370,6 +403,18 @@ cmd_list() {
     total_human="${total_size} B"
   fi
   echo "${count} file(s), ${total_human} total" >&2
+}
+
+# Human-readable size formatter
+format_size() {
+  local s=$1
+  if [[ "$s" -ge $((1024 * 1024)) ]]; then
+    echo "$(( s / 1024 / 1024 )) MB"
+  elif [[ "$s" -ge 1024 ]]; then
+    echo "$(( s / 1024 )) KB"
+  else
+    echo "${s} B"
+  fi
 }
 
 # Show storage stats
@@ -419,39 +464,35 @@ cmd_stats() {
     esac
   done <<< "$assets"
 
-  local fmt_size
-  fmt_size() {
-    local s=$1
-    if [[ "$s" -ge $((1024 * 1024)) ]]; then
-      echo "$(( s / 1024 / 1024 )) MB"
-    elif [[ "$s" -ge 1024 ]]; then
-      echo "$(( s / 1024 )) KB"
-    else
-      echo "${s} B"
-    fi
-  }
+  local tag_encoded
+  tag_encoded=$(urlencode "$RELEASE_TAG")
 
   echo "Storage stats for '$RELEASE_TAG' in $repo"
   echo ""
-  printf "  %-12s %5s files  %10s\n" "Images" "$img_count" "$(fmt_size $img_size)"
-  printf "  %-12s %5s files  %10s\n" "Videos" "$vid_count" "$(fmt_size $vid_size)"
-  printf "  %-12s %5s files  %10s\n" "Audio" "$aud_count" "$(fmt_size $aud_size)"
-  printf "  %-12s %5s files  %10s\n" "Documents" "$doc_count" "$(fmt_size $doc_size)"
-  printf "  %-12s %5s files  %10s\n" "Code" "$code_count" "$(fmt_size $code_size)"
-  printf "  %-12s %5s files  %10s\n" "Archives" "$arc_count" "$(fmt_size $arc_size)"
-  printf "  %-12s %5s files  %10s\n" "Other" "$other_count" "$(fmt_size $other_size)"
+  printf "  %-12s %5s files  %10s\n" "Images" "$img_count" "$(format_size $img_size)"
+  printf "  %-12s %5s files  %10s\n" "Videos" "$vid_count" "$(format_size $vid_size)"
+  printf "  %-12s %5s files  %10s\n" "Audio" "$aud_count" "$(format_size $aud_size)"
+  printf "  %-12s %5s files  %10s\n" "Documents" "$doc_count" "$(format_size $doc_size)"
+  printf "  %-12s %5s files  %10s\n" "Code" "$code_count" "$(format_size $code_size)"
+  printf "  %-12s %5s files  %10s\n" "Archives" "$arc_count" "$(format_size $arc_size)"
+  printf "  %-12s %5s files  %10s\n" "Other" "$other_count" "$(format_size $other_size)"
   echo "  ────────────────────────────────"
-  printf "  %-12s %5s files  %10s\n" "Total" "$count" "$(fmt_size $total_size)"
+  printf "  %-12s %5s files  %10s\n" "Total" "$count" "$(format_size $total_size)"
   echo ""
   echo "GitHub repo storage limits: 5 GB (warning at 1 GB)"
   echo "Release assets count toward total repo size."
-  echo "View in browser: https://github.com/${repo}/releases/tag/${RELEASE_TAG}"
+  echo "View in browser: https://github.com/${repo}/releases/tag/${tag_encoded}"
 }
 
 # Cleanup old assets
 cmd_cleanup() {
   local repo="$1"
   local cleanup_arg="$2"
+
+  # Require interactive terminal for confirmation
+  if [[ ! -t 0 ]]; then
+    die "Cleanup requires interactive confirmation (stdin must be a terminal)"
+  fi
 
   if ! gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1; then
     echo "No attachments found (release '$RELEASE_TAG' does not exist in $repo)" >&2
@@ -475,12 +516,16 @@ cmd_cleanup() {
   if [[ "$cleanup_arg" =~ ^[0-9]+d$ ]]; then
     # Delete assets older than N days
     local days="${cleanup_arg%d}"
+
+    # Cap days to a reasonable maximum
+    if [[ "$days" -gt 36500 ]]; then
+      die "Invalid cleanup days: ${days} (max 36500 — ~100 years)"
+    fi
+
     local cutoff
     if date -v-1d >/dev/null 2>&1; then
-      # macOS
       cutoff=$(date -v-"${days}"d +%Y-%m-%dT%H:%M:%S)
     else
-      # Linux
       cutoff=$(date -d "${days} days ago" +%Y-%m-%dT%H:%M:%S)
     fi
 
@@ -500,6 +545,11 @@ cmd_cleanup() {
   elif [[ "$cleanup_arg" =~ ^[0-9]+$ ]]; then
     # Keep only the latest N assets
     local keep="$cleanup_arg"
+
+    # Must keep at least 1 asset
+    if [[ "$keep" -lt 1 ]]; then
+      die "Must keep at least 1 asset (got: $keep)"
+    fi
 
     if [[ "$total_count" -le "$keep" ]]; then
       echo "Only ${total_count} asset(s) — nothing to clean up (keeping ${keep})" >&2
@@ -581,12 +631,12 @@ main() {
       -v|--version) echo "gh-file-attach $VERSION"; exit 0 ;;
       -r|--repo)
         REPO="${2:?--repo requires OWNER/REPO}"
-        [[ "$REPO" != -* ]] || die "Invalid repo: '$REPO' (must not start with -)"
+        validate_repo "$REPO"
         shift 2
         ;;
       -t|--tag)
         RELEASE_TAG="${2:?--tag requires a value}"
-        [[ "$RELEASE_TAG" != -* ]] || die "Invalid tag: '$RELEASE_TAG' (must not start with -)"
+        validate_tag "$RELEASE_TAG"
         shift 2
         ;;
       -m|--markdown) markdown=true; shift ;;
@@ -637,6 +687,11 @@ main() {
       labels+=("")
     fi
   done
+
+  # Guard against uploading too many files at once
+  if [[ ${#files[@]} -gt "$MAX_FILES_PER_RUN" ]]; then
+    die "Too many files (${#files[@]}). Max ${MAX_FILES_PER_RUN} per invocation."
+  fi
 
   local repo
   repo=$(resolve_repo)
