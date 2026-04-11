@@ -693,6 +693,22 @@ main() {
     die "Too many files (${#files[@]}). Max ${MAX_FILES_PER_RUN} per invocation."
   fi
 
+  # Pre-validate all files before touching the remote
+  for file in "${files[@]}"; do
+    [[ -f "$file" && ! -L "$file" ]] || die "File not found or is a symlink: $file"
+    local ext="${file##*.}"
+    ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+    local category
+    category=$(classify_file "$ext")
+    [[ "$category" != "unsupported" ]] || die "Unsupported file type: .$ext (run --help to see supported formats)"
+    local size max_size
+    size=$(file_size "$file")
+    max_size=$(max_size_for "$category")
+    if [[ "$size" -gt "$max_size" ]]; then
+      die "File too large: $file ($(( size / 1024 / 1024 ))MB, max $(( max_size / 1024 / 1024 ))MB for $category files)"
+    fi
+  done
+
   local repo
   repo=$(resolve_repo)
 
